@@ -1,0 +1,84 @@
+name: Update Manifest
+
+on:
+  repository_dispatch:
+    types: [manifest-update]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to update to (leave empty to fetch latest)"
+        required: false
+        type: string
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ -n "${{ github.event.client_payload.version }}" ]]; then
+            VERSION="${{ github.event.client_payload.version }}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(curl -s https://api.github.com/repos/rafaeltonholo/svg-to-compose/releases/latest | jq -r '.tag_name')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Check if update is needed
+        id: check
+        run: |
+          CURRENT=$(jq -r '.version' bucket/s2c.json)
+          NEW="${{ steps.version.outputs.version }}"
+          echo "Current: $CURRENT, New: $NEW"
+          if [[ "$CURRENT" == "$NEW" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download binary and compute SHA256
+        if: steps.check.outputs.skip == 'false'
+        id: hash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          FILE="s2c-mingwX64-binaries.zip"
+          curl -sL -o "$FILE" "https://github.com/rafaeltonholo/svg-to-compose/releases/download/${VERSION}/${FILE}"
+          HASH=$(sha256sum "$FILE" | cut -d' ' -f1)
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          echo "mingwX64: $HASH"
+
+      - name: Update manifest
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          HASH="${{ steps.hash.outputs.sha256 }}"
+
+          jq \
+            --arg version "$VERSION" \
+            --arg hash "$HASH" \
+            --arg url "https://github.com/rafaeltonholo/svg-to-compose/releases/download/$VERSION/s2c-mingwX64-binaries.zip" \
+            '.version = $version | .architecture."64bit".url = $url | .architecture."64bit".hash = $hash' \
+            bucket/s2c.json > bucket/s2c.json.tmp && mv bucket/s2c.json.tmp bucket/s2c.json
+
+      - name: Create Pull Request
+        if: steps.check.outputs.skip == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          title: "Update s2c to ${{ steps.version.outputs.version }}"
+          body: |
+            Automated manifest update for s2c version `${{ steps.version.outputs.version }}`.
+
+            **SHA256 hash:**
+            - Windows x64: `${{ steps.hash.outputs.sha256 }}`
+          branch: "update/s2c-${{ steps.version.outputs.version }}"
+          commit-message: "Update s2c to ${{ steps.version.outputs.version }}"
